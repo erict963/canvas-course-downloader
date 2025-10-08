@@ -668,16 +668,16 @@ def main():
         pattern = re.compile(r'courses/(\d+)')
         match = pattern.search(url)
         if not match:
-            raise argparse.ArgumentTypeError("URL does not contain a valid file ID (e.g. /files/123)")
+            raise argparse.ArgumentTypeError("URL does not contain a valid course ID (e.g. /courses/123)")
         return url
 
     env_canvas_session = os.environ.get('CANVAS_SESSION')
 
-    parser = argparse.ArgumentParser(description='Canvas file sweeper')
+    parser = argparse.ArgumentParser(description='Canvas course downloader')
     parser.add_argument('-u', '--url', 
                         type=validate_url,
                         required=True, 
-                        help='The Course URL of the file to start from, e.g. https://canvas.example.edu/courses/123')
+                        help='The Course URL, e.g. https://canvas.example.edu/courses/123')
     parser.add_argument('-s', '--canvas-session', 
                         type=str, 
                         required=not bool(env_canvas_session), 
