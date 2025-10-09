@@ -500,8 +500,6 @@ class CanvasCourseScraper:
                 'name': file.get('display_name', file.get('filename', f'File_{file_id}')),
                 'created_at': file.get('created_at', None),
                 'updated_at': file.get('updated_at', None),
-                'locked': file.get('locked', None),
-                'hidden': file.get('hidden', None),
                 'size': file.get('size', None),
                 'download_url': file.get('url', None),
             }
