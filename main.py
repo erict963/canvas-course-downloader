@@ -184,7 +184,8 @@ class CanvasClient:
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
             'Content-Type': 'application/json'
         })
-        self.session.cookies['canvas_session'] = self.canvas_session
+        if self.canvas_session:
+            self.session.cookies['canvas_session'] = self.canvas_session
 
     @retry(num_retries=3, delay=2, exceptions=(socket.timeout, ))
     def _request(self, method: str, endpoint: str, params: Optional[Dict] = None) -> Dict:
@@ -640,13 +641,21 @@ class CanvasCourseScraper:
             return self
         course_name = sanitize(course.get('name', f'MISC_{course["id"]}'))
         print(f'********* Course: {course_name} ({course["id"]}) *********')
+        print(f'********* Modules *********')
         self.scrape_modules()
+        print(f'********* Assignments *********')
         self.scrape_assignments()
+        print(f'********* Assignment Groups *********')
         self.scrape_assignment_groups()
+        print(f'********* Folders *********')
         self.scrape_folders()
+        print(f'********* Syllabus *********')
         self.scrape_syllabus()
+        print(f'********* Pages *********')
         self.scrape_pages()
+        print(f'********* Front Page *********')
         self.scrape_front_page()
+        print(f'********* Remaining Files *********')
         self.scrape_remaining_files()
         return self
         
@@ -680,7 +689,7 @@ def main():
                         help='The Course URL, e.g. https://canvas.example.edu/courses/123')
     parser.add_argument('-s', '--canvas-session', 
                         type=str, 
-                        required=not bool(env_canvas_session), 
+                        required=False, 
                         default=env_canvas_session,
                         help='The Canvas API canvas session, provided as an environment variable or command line argument.  If not provided, the script will use the CANVAS_SESSION environment variable.')
     parser.add_argument('-o', '--output-folder', 
@@ -693,13 +702,17 @@ def main():
     
     args = parser.parse_args()
     course_id = re.search(r'courses/(\d+)', args.url).group(1)
-    canvas_session = args.canvas_session
+    canvas_session = '' if args.canvas_session is None else args.canvas_session
 
     canvas = CanvasClient(
         base_url=re.sub(r'/courses/\d+.*$', '', args.url),
         canvas_session=canvas_session
     )
-    course_name = sanitize(canvas.get_course(course_id).get('name', f'Course_{course_id}'))
+    try:
+        course_name = sanitize(canvas.get_course(course_id).get('name', f'Course_{course_id}'))
+    except UnauthenticatedError as e:
+        print('Error: Unauthenticated. Your course requires login. Please check your CANVAS_SESSION value. You either entered an invalid value or your session has expired.')
+        return
     output_folder = os.path.join(args.output_folder, f'{course_name}_{course_id}')
     scraper = CanvasCourseScraper(canvas, course_id).scrape_course()
     print(f'Total files found: {len(scraper.files)}')
