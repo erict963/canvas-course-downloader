@@ -489,6 +489,7 @@ class CanvasCourseScraper:
 
     @ignore_exceptions((UnauthrorizedError, ResourceDoesNotExistError))
     def scrape_file(self, file_id: Union[int, str]) -> None:
+        file_id = int(file_id)
         if file_id in self.files_downloaded:
             print(f'File {file_id} already downloaded')
             return
