@@ -36,7 +36,7 @@ def ignore_exceptions(exceptions=(Exception,)):
         return wrapper
     return decorator
 
-
+MAX_PER_PAGE = 100
 # exceptions
 class UnauthrorizedError(Exception):
     pass
@@ -248,7 +248,7 @@ class CanvasClient:
         kwargs['context_codes'] = [f'course_{course_id}']
         kwargs['start_date'] = kwargs.get('start_date', '1900-01-01')
         kwargs['end_date'] = kwargs.get('end_date', datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'))
-        kwargs['per_page'] = kwargs.get('per_page', 100)
+        kwargs['per_page'] = kwargs.get('per_page', MAX_PER_PAGE)
         kwargs['page'] = kwargs.get('page', 1)
         return self._request("GET", "announcements", params=kwargs)
 
@@ -565,7 +565,7 @@ class CanvasCourseScraper:
                 'exclude_response_fields[]': ['description', 'rubric'],
                 'include[]': ['assignments', 'discussion_topic'],
                 'override_assignment_dates': True,
-                'per_page': 200
+                'per_page': MAX_PER_PAGE
             }
         )
         if not assignment_groups:
@@ -594,7 +594,7 @@ class CanvasCourseScraper:
                 print(f'Unknown type: {item["type"]}')
     
     def scrape_modules(self) -> None:
-        modules = self.canvas.get_modules(self.course_id)
+        modules = self.canvas.get_modules(self.course_id, **{'per_page': MAX_PER_PAGE})
         if not modules:
             return
         for module in modules:
