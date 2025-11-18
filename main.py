@@ -578,7 +578,7 @@ class CanvasCourseScraper:
         module = self.canvas.get_module(module['id'], self.course_id)
         if not module or 'items_url' not in module:
             return
-        items = self.canvas._request("GET", module['items_url'].replace(self.canvas.base_url + '/', ''))
+        items = self.canvas._request("GET", module['items_url'].replace(self.canvas.base_url + '/', ''), params={'per_page': MAX_PER_PAGE})
         for item in items:
             if item['type'] == 'File':
                 self.scrape_file(item['content_id'])
