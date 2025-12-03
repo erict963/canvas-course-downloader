@@ -543,11 +543,21 @@ class CanvasCourseScraper:
     
     def scrape_assignment(self, assignment_id: Union[int, str]) -> None:
         assignment = self.canvas.get_assignment(assignment_id, self.course_id)
-        if not assignment or not assignment.get('description', ''):
+        if not assignment:
             return
+        description = assignment.get('description', '') or ''
+        html_content = ''
+        html_url = assignment.get('html_url')
+        if html_url:
+            try:
+                response = self.canvas.session.get(html_url)
+                if response.status_code == 200:
+                    html_content = response.text
+            except Exception as e:
+                print(f"Failed to fetch assignment HTML: {e}")
         self.scrape_html_content(
             sanitize(assignment.get('name', f'Assignment_{assignment_id}')) + '.html',
-            assignment['description']
+            description + html_content
         )
     
     def scrape_assignments(self) -> None:
