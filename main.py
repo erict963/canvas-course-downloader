@@ -410,6 +410,8 @@ class CanvasClient:
         response = self._request("GET", f"courses/{course_id}/pages", params=kwargs)
         if isinstance(response, dict) and response.get('message', '') == 'That page has been disabled for this course':
             raise ResourceDoesNotExistError(f'Pages have been disabled for course ID: {course_id}')
+        elif isinstance(response, dict) and len(response.keys()) == 1 and response.get('message') != '':
+            raise ResourceDoesNotExistError(f'Error retrieving pages for course ID: {course_id}: {response.get("message")}')
         return response
 
     def get_user(self, user_id: Union[int, str], id_type: Optional[str] = None, **kwargs) -> Dict:
