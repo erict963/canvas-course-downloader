@@ -355,7 +355,12 @@ class CanvasClient:
 
         :param course_id: The ID of the course to retrieve folders from.
         """
-        return self._request("GET", f"courses/{course_id}/folders", params=kwargs)
+        response = self._request("GET", f"courses/{course_id}/folders", params=kwargs)
+        if isinstance(response, dict) and response.get('status') == 'unauthenticated':
+            raise UnauthenticatedError(f'Unauthenticated to access /courses/{course_id}/folders')
+        if isinstance(response, dict) and response.get('status') == 'unauthorized':
+            raise UnauthrorizedError(f'Unauthorized to access /courses/{course_id}/folders')
+        return response
 
     def get_folder_files(self, folder_id: Union[int, str], **kwargs) -> List[Dict]:
         """
@@ -618,12 +623,13 @@ class CanvasCourseScraper:
         self.scrape_files(list(remaining_file_ids))
     
     @ignore_exceptions((UnauthrorizedError, UnauthenticatedError))
-    def scrape_folder(self, folder: Union[int, str]) -> None:
+    def scrape_folder(self, folder: dict) -> None:
         folder_id = re.search(r'/folders/(\d+)/files', folder['files_url'])
         files = self.canvas.get_folder_files(folder_id.group(1))
         file_ids = [file['id'] for file in files]
         self.scrape_files(file_ids)
 
+    @ignore_exceptions((UnauthrorizedError, UnauthenticatedError))
     def scrape_folders(self) -> None:
         folders = self.canvas.get_folders(self.course_id)
         if not folders:
