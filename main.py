@@ -1,3 +1,4 @@
+import html
 import json
 import re
 import os
@@ -30,13 +31,13 @@ def ignore_exceptions(exceptions=(Exception,)):
             try:
                 return func(*args, **kwargs)
             except exceptions as e:
-                error_names = [ex.__name__ for ex in exceptions]
-                print(f'Ignoring exception {e} of type {type(e).__name__}, expected types: {error_names}')
                 return None
         return wrapper
     return decorator
 
 MAX_PER_PAGE = 100
+MAX_ITERATIONS = 100
+
 # exceptions
 class UnauthrorizedError(Exception):
     pass
@@ -115,41 +116,62 @@ class HttpSession:
         except Exception as e:
             raise Exception(f"Failed to connect to {host}:{port}: {e}")
     
-    def request(self, method: str, url: str, **kwargs) -> HttpResponse:
-        """Make HTTP request with connection pooling"""
-        parsed = urllib.parse.urlparse(url)
-        host = parsed.netloc
-        path = parsed.path
-        if parsed.query:
-            path += f"?{parsed.query}"
+    def request(self, method: str, url: str, max_redirects: int = 10, **kwargs) -> HttpResponse:
+        """Make HTTP request with connection pooling and redirect following"""
+        redirects = 0
         
-        use_ssl = parsed.scheme == 'https'
-        port = parsed.port or (443 if use_ssl else 80)
+        while redirects < max_redirects:
+            parsed = urllib.parse.urlparse(url)
+            host = parsed.netloc
+            path = parsed.path
+            if parsed.query:
+                path += f"?{parsed.query}"
+            
+            use_ssl = parsed.scheme == 'https'
+            port = parsed.port or (443 if use_ssl else 80)
+            
+            headers = self.headers.copy()
+            if 'headers' in kwargs:
+                headers.update(kwargs['headers'])
+            
+            if self.cookies:
+                cookie_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
+                headers['Cookie'] = cookie_str
+            
+            conn = self._get_connection(host, port)
+            
+            try:
+                conn.request(method, path, headers=headers)
+                response = conn.getresponse()
+                data = response.read()
+                
+                # Check for redirects
+                if response.status in (301, 302, 303, 307, 308):
+                    location = response.getheader('Location')
+                    if location:
+                        # Handle relative URLs
+                        if not location.startswith('http'):
+                            location = urllib.parse.urljoin(url, location)
+                        url = location
+                        redirects += 1
+                        # For 303, change method to GET
+                        if response.status == 303:
+                            method = 'GET'
+                        continue
+                
+                return HttpResponse(response, data)
+                
+            except (socket.timeout, socket.error, http.client.HTTPException) as e:
+                conn_key = f"{host}:{port}:{use_ssl}"
+                if conn_key in self.connections:
+                    try:
+                        self.connections[conn_key].close()
+                    except:
+                        pass
+                    del self.connections[conn_key]
+                raise
         
-        headers = self.headers.copy()
-        if 'headers' in kwargs:
-            headers.update(kwargs['headers'])
-        
-        if self.cookies:
-            cookie_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-            headers['Cookie'] = cookie_str
-        
-        conn = self._get_connection(host, port)
-        
-        try:
-            conn.request(method, path, headers=headers)
-            response = conn.getresponse()
-            data = response.read()
-            return HttpResponse(response, data)
-        except (socket.timeout, socket.error, http.client.HTTPException) as e:
-            conn_key = f"{host}:{port}:{use_ssl}"
-            if conn_key in self.connections:
-                try:
-                    self.connections[conn_key].close()
-                except:
-                    pass
-                del self.connections[conn_key]
-            raise
+        raise Exception(f"Too many redirects (>{max_redirects})")
     
     def get(self, url: str, **kwargs) -> HttpResponse:
         return self.request('GET', url, **kwargs)
@@ -176,7 +198,8 @@ class CanvasClient:
         assert 'https://' in base_url, "Canvas base_url must start with 'https://'"
         assert base_url.strip(), "Canvas base_url must be a non-blank string"
 
-        self.base_url = base_url.strip().rstrip('/') + '/api/v1'
+        self.base_url = base_url.strip().rstrip('/')
+        self.api_url = base_url.strip().rstrip('/') + '/api/v1'
         self.canvas_session = canvas_session.strip()
         
         self.session = HttpSession()
@@ -188,14 +211,29 @@ class CanvasClient:
             self.session.cookies['canvas_session'] = self.canvas_session
 
     @retry(num_retries=3, delay=2, exceptions=(socket.timeout, ))
-    def _request(self, method: str, endpoint: str, params: Optional[Dict] = None) -> Dict:
-        url = f"{self.base_url}/{endpoint}"
+    def _request(self, endpoint: str, params: Optional[Dict] = None, use_api_url: bool = True) -> Dict:
+        if not use_api_url:
+            url = f"{self.base_url}/{endpoint}"
+            response = self.session.get(url)
+            return response.text
         
-        # Add query parameters if provided
-        if params:
-            query_string = urllib.parse.urlencode(params, doseq=True)
-            url = f"{url}?{query_string}"
+        url = f"{self.api_url}/{endpoint}"
         
+        # Check if pagination is requested
+        should_paginate = params and 'per_page' in params and params.get('per_page') == MAX_PER_PAGE
+        
+        if should_paginate:
+            return self._paginated_request(url, params)
+        else:
+            # Single request without pagination
+            if params:
+                query_string = urllib.parse.urlencode(params, doseq=True)
+                url = f"{url}?{query_string}"
+            
+            return self._make_single_request(url)
+
+    def _make_single_request(self, url: str) -> Dict:
+        """Make a single HTTP request and return JSON response."""
         try:
             response = self.session.get(url)
             
@@ -214,6 +252,57 @@ class CanvasClient:
             print(f"Request error for URL: {url} - {e}")
             raise
 
+    def _paginated_request(self, url: str, params: Dict) -> List[Dict]:
+        """Make paginated requests and aggregate results."""
+        all_results = []
+        
+        for page in range(1, MAX_ITERATIONS + 1):
+            page_params = params.copy()
+            page_params['page'] = page
+            
+            query_string = urllib.parse.urlencode(page_params, doseq=True)
+            page_url = f"{url}?{query_string}"
+            
+            try:
+                response = self.session.get(page_url)
+                
+                if response.status_code >= 400:
+                    if page == 1:
+                        try:
+                            return response.json()
+                        except:
+                            return {'error': f'HTTP {response.status_code}: {response.reason}'}
+                    break
+                
+                page_data = response.json()
+                
+                # If response is a dict (error or single object), handle it
+                if isinstance(page_data, dict):
+                    return page_data if page == 1 else all_results
+                
+                # If empty list, we've reached the end
+                if not page_data:
+                    break
+                
+                all_results.extend(page_data)
+                
+                # If fewer results than per_page, we've reached the end
+                if len(page_data) < MAX_PER_PAGE:
+                    break
+                    
+            except socket.timeout:
+                print(f"Request timeout for URL: {page_url}")
+                if page == 1:
+                    raise
+                break
+            except Exception as e:
+                print(f"Request error for URL: {page_url} - {e}")
+                if page == 1:
+                    raise
+                break
+        
+        return all_results
+
     def get_assignment(self, assignment_id: Union[int, str], course_id: Union[int, str], **kwargs) -> Dict:
         """
         Return a single assignment.
@@ -221,7 +310,10 @@ class CanvasClient:
         :param assignment_id: The ID of the assignment to retrieve.
         :param course_id: The ID of the course the assignment belongs to.
         """
-        return self._request("GET", f"courses/{course_id}/assignments/{assignment_id}", params=kwargs)
+        response = self._request(f"courses/{course_id}/assignments/{assignment_id}", params=kwargs)
+        if isinstance(response, dict) and response.get('status') == 'unauthenticated':
+            raise UnauthenticatedError(f'Unauthenticated to access assignment ID: {assignment_id} for course ID: {course_id}')
+        return response
 
     def get_assignments(self, course_id: Union[int, str], **kwargs) -> List[Dict]:
         """
@@ -229,7 +321,10 @@ class CanvasClient:
 
         :param course_id: The ID of the course to retrieve assignments from.
         """
-        return self._request("GET", f"courses/{course_id}/assignments", params=kwargs)
+        response = self._request(f"courses/{course_id}/assignments", params=kwargs)
+        if isinstance(response, dict) and response.get('status') == 'unauthenticated':
+            raise UnauthenticatedError(f'Unauthenticated to access assignments for course ID: {course_id}')
+        return response
     
     def get_assignment_groups(self, course_id: Union[int, str], **kwargs) -> List[Dict]:
         """
@@ -237,7 +332,7 @@ class CanvasClient:
 
         :param course_id: The ID of the course to retrieve assignment groups from.
         """
-        return self._request("GET", f"courses/{course_id}/assignment_groups", params=kwargs)
+        return self._request(f"courses/{course_id}/assignment_groups", params=kwargs)
     
     def get_announcements(self, course_id: int, **kwargs) -> List[Dict]:
         """
@@ -250,21 +345,7 @@ class CanvasClient:
         kwargs['end_date'] = kwargs.get('end_date', datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'))
         kwargs['per_page'] = kwargs.get('per_page', MAX_PER_PAGE)
         kwargs['page'] = kwargs.get('page', 1)
-        return self._request("GET", "announcements", params=kwargs)
-
-    def get_conversation(self, conversation_id: Union[int, str], **kwargs) -> Dict:
-        """
-        Return single Conversation.
-
-        :param conversation_id: The ID of the conversation.
-        """
-        return self._request("GET", f"conversations/{conversation_id}", params=kwargs)
-
-    def get_conversations(self, **kwargs) -> List[Dict]:
-        """
-        Return list of conversations for the current user, most recent ones first.
-        """
-        return self._request("GET", "conversations", params=kwargs)
+        return self._request("announcements", params=kwargs)
 
     def get_course(self, course_id: Union[int, str], **kwargs) -> Dict:
         """
@@ -272,45 +353,18 @@ class CanvasClient:
 
         :param course_id: The ID of the course to retrieve.
         """
-        response =  self._request("GET", f"courses/{course_id}", params=kwargs)
+        response =  self._request(f"courses/{course_id}", params=kwargs)
         if isinstance(response, dict) and response.get('status') == 'unauthenticated':
             raise UnauthenticatedError(f'Unauthenticated to access course ID: {course_id}')
         if isinstance(response, dict) and response.get('status') == 'unauthorized':
             raise UnauthrorizedError(f'Unauthorized to access course ID: {course_id}')
         return response
 
-    def get_course_accounts(self, **kwargs) -> List[Dict]:
-        """
-        List accounts that the current user can view through their
-        admin course enrollments (Teacher, TA or designer enrollments).
-        """
-        return self._request("GET", "course_accounts", params=kwargs)
-
     def get_courses(self, **kwargs) -> List[Dict]:
         """
         Return a list of active courses for the current user.
         """
-        return self._request("GET", "courses", params=kwargs)
-
-    def get_current_user(self) -> Dict:
-        """
-        Return details of the current user.
-        """
-        return self._request("GET", "users/self")
-
-    def get_eportfolio(self, eportfolio_id: Union[int, str], **kwargs) -> Dict:
-        """
-        Get an eportfolio by ID.
-
-        :param eportfolio_id: The ID of the eportfolio to retrieve.
-        """
-        return self._request("GET", f"eportfolios/{eportfolio_id}", params=kwargs)
-
-    def get_epub_exports(self, **kwargs) -> List[Dict]:
-        """
-        Return a list of epub exports for the associated course.
-        """
-        return self._request("GET", "epub_exports", params=kwargs)
+        return self._request("courses", params=kwargs)
 
     def get_file(self, file_id: Union[int, str], course_id: Union[int, str] = None, **kwargs) -> Dict:
         """
@@ -319,9 +373,9 @@ class CanvasClient:
         :param file_id: The ID of the file to retrieve.
         """
         if course_id is None:
-            response = self._request("GET", f"files/{file_id}", params=kwargs)
+            response = self._request(f"files/{file_id}", params=kwargs)
         
-        response = self._request("GET", f"courses/{course_id}/files/{file_id}", params=kwargs)
+        response = self._request(f"courses/{course_id}/files/{file_id}", params=kwargs)
         if isinstance(response, dict) and response.get('status') == 'unauthorized':
             raise UnauthrorizedError(f'Unauthorized to access /courses/{course_id}/files/{file_id}')
         elif isinstance(response, dict) and response.get('errors', '') == [{'message': 'The specified resource does not exist.'}]:
@@ -334,7 +388,7 @@ class CanvasClient:
 
         :param course_id: The ID of the course to retrieve files from.
         """
-        response = self._request("GET", f"courses/{course_id}/files", params=kwargs)
+        response = self._request(f"courses/{course_id}/files", params=kwargs)
         if isinstance(response, dict) and response.get('status') == 'unauthenticated':
             raise UnauthenticatedError(f'Unauthenticated to access /courses/{course_id}/files')
         if isinstance(response, dict) and response.get('status') == 'unauthorized':
@@ -347,7 +401,7 @@ class CanvasClient:
 
         :param folder_id: The ID of the folder to retrieve.
         """
-        return self._request("GET", f"folders/{folder_id}", params=kwargs)
+        return self._request(f"folders/{folder_id}", params=kwargs)
 
     def get_folders(self, course_id: Union[int, str], **kwargs) -> List[Dict]:
         """
@@ -355,7 +409,7 @@ class CanvasClient:
 
         :param course_id: The ID of the course to retrieve folders from.
         """
-        response = self._request("GET", f"courses/{course_id}/folders", params=kwargs)
+        response = self._request(f"courses/{course_id}/folders", params=kwargs)
         if isinstance(response, dict) and response.get('status') == 'unauthenticated':
             raise UnauthenticatedError(f'Unauthenticated to access /courses/{course_id}/folders')
         if isinstance(response, dict) and response.get('status') == 'unauthorized':
@@ -368,7 +422,7 @@ class CanvasClient:
 
         :param folder_id: The ID of the folder to retrieve files from.
         """
-        response = self._request("GET", f"folders/{folder_id}/files", params=kwargs)
+        response = self._request(f"folders/{folder_id}/files", params=kwargs)
         if isinstance(response, dict) and response.get('status') == 'unauthenticated':
             raise UnauthenticatedError(f'Unauthenticated to access /folders/{folder_id}/files')
         if isinstance(response, dict) and response.get('status') == 'unauthorized':
@@ -382,7 +436,16 @@ class CanvasClient:
         :param module_id: The ID of the module to retrieve.
         :param course_id: The ID of the course the module belongs to.
         """
-        return self._request("GET", f"courses/{course_id}/modules/{module_id}", params=kwargs)
+        return self._request(f"courses/{course_id}/modules/{module_id}", params=kwargs)
+
+    def get_module_items(self, module_id: Union[int, str], course_id: Union[int, str], **kwargs) -> List[Dict]:
+        """
+        Return the list of items in a module.
+
+        :param module_id: The ID of the module to retrieve items from.
+        :param course_id: The ID of the course the module belongs to.
+        """
+        return self._request(f"courses/{course_id}/modules/{module_id}/items", params=kwargs)
 
     def get_modules(self, course_id: Union[int, str], **kwargs) -> List[Dict]:
         """
@@ -390,7 +453,10 @@ class CanvasClient:
 
         :param course_id: The ID of the course to retrieve modules from.
         """
-        return self._request("GET", f"courses/{course_id}/modules", params=kwargs)
+        response = self._request(f"courses/{course_id}/modules", params=kwargs)
+        if isinstance(response, dict) and response.get('status') == 'unauthenticated':
+            raise UnauthenticatedError(f'Unauthenticated to access /courses/{course_id}/modules')
+        return response
 
     def get_page(self, page_id: Union[int, str], course_id: Union[int, str], **kwargs) -> Dict:
         """
@@ -399,7 +465,7 @@ class CanvasClient:
         :param page_id: The URL name of the page to retrieve.
         :param course_id: The ID of the course the page belongs to.
         """
-        return self._request("GET", f"courses/{course_id}/pages/{page_id}", params=kwargs)
+        return self._request(f"courses/{course_id}/pages/{page_id}", params=kwargs)
     
     def get_pages(self, course_id: Union[int, str], **kwargs) -> List[Dict] | Dict:
         """
@@ -407,34 +473,14 @@ class CanvasClient:
 
         :param course_id: The ID of the course to retrieve pages from.
         """
-        response = self._request("GET", f"courses/{course_id}/pages", params=kwargs)
+        response = self._request(f"courses/{course_id}/pages", params=kwargs)
         if isinstance(response, dict) and response.get('message', '') == 'That page has been disabled for this course':
             raise ResourceDoesNotExistError(f'Pages have been disabled for course ID: {course_id}')
         elif isinstance(response, dict) and len(response.keys()) == 1 and response.get('message') != '':
             raise ResourceDoesNotExistError(f'Error retrieving pages for course ID: {course_id}: {response.get("message")}')
+        elif isinstance(response, dict) and response.get('status') == 'unauthenticated':
+            raise UnauthenticatedError(f'Unauthenticated to access /courses/{course_id}/pages')
         return response
-
-    def get_user(self, user_id: Union[int, str], id_type: Optional[str] = None, **kwargs) -> Dict:
-        """
-        Retrieve a user by their ID.
-
-        :param user_id: The user's ID.
-        :param id_type: The ID type (e.g., 'sis_user_id', 'sis_login_id').
-        """
-        if id_type:
-            endpoint = f"users/{id_type}:{user_id}"
-        elif user_id == "self":
-            endpoint = "users/self"
-        else:
-            endpoint = f"users/{user_id}"
-
-        return self._request("GET", endpoint, params=kwargs)
-
-    def search_all_courses(self, **kwargs) -> List[Dict]:
-        """
-        List all the courses visible in the public index.
-        """
-        return self._request("GET", "search/all_courses", params=kwargs)
 
     def show_front_page(self, course_id: Union[int, str], **kwargs) -> Dict:
         """
@@ -442,9 +488,11 @@ class CanvasClient:
 
         :param course_id: The ID of the course to retrieve the front page from.
         """
-        response = self._request("GET", f"courses/{course_id}/front_page", params=kwargs)
+        response = self._request(f"courses/{course_id}/front_page", params=kwargs)
         if isinstance(response, dict) and response.get('message', '') == 'No front page has been set':
             raise ResourceDoesNotExistError(f'No front page has been set for course ID: {course_id}')
+        elif isinstance(response, dict) and response.get('status') == 'unauthenticated':
+            raise UnauthenticatedError(f'Unauthenticated to access /courses/{course_id}/front_page')
         return response
     
 
@@ -493,12 +541,19 @@ class CanvasCourseScraper:
         self.course_id = course_id
         self.files_downloaded = set()
         self.files: List[Dict] = []
+    
+    def _try_api(self, api_func, fallback_frontend_func = None) -> Union[List[Dict], None]:
+        try:
+            return api_func()
+        except UnauthenticatedError:
+            if fallback_frontend_func:
+                fallback_frontend_func()
+        return None
 
     @ignore_exceptions((UnauthrorizedError, ResourceDoesNotExistError))
     def scrape_file(self, file_id: Union[int, str]) -> None:
         file_id = int(file_id)
         if file_id in self.files_downloaded:
-            print(f'File {file_id} already downloaded')
             return
         file = self.canvas.get_file(file_id, self.course_id)
         self.files.append(
@@ -521,54 +576,63 @@ class CanvasCourseScraper:
         for file_id in file_ids:
             self.scrape_file(file_id)
     
-    def scrape_html_content(self, html_file_name: str, html: str) -> None:
-        # write_to_file(os.path.join(self.output_folder, html_file_name), html)
+    def scrape_html_content(self, html: str) -> None:
         file_ids = extract_files(html)
         self.scrape_files(file_ids)
     
     def scrape_external_url(self, item: Dict) -> None:
-        # write_to_file(
-        #     os.path.join(self.output_folder, sanitize(item['title']) + '.txt'),
-        #     item['external_url']
-        # )
         pass
     
     def scrape_page(self, page_id: Union[int, str]) -> None:
         page = self.canvas.get_page(page_id, self.course_id)
-        if not page or not page.get('body', ''):
+        if not page:
             return
         self.scrape_html_content(
-            sanitize(page.get('title', f'Page_{page_id}')) + '.html',
-            page.get('body', '')
+            page.get('body', '') or ''
         )
     
     @ignore_exceptions((ResourceDoesNotExistError,))
     def scrape_pages(self) -> None:
-        pages = self.canvas.get_pages(self.course_id)
+        pages = self._try_api(
+            lambda: self.canvas.get_pages(self.course_id, **{'per_page': MAX_PER_PAGE}),
+            fallback_frontend_func=lambda: print('Unauthenticated to access pages (API only, requires login).')
+        )
+        if not pages:
+            return
         for page in pages:
             self.scrape_page(page['page_id'])
     
     def scrape_assignment(self, assignment_id: Union[int, str]) -> None:
-        assignment = self.canvas.get_assignment(assignment_id, self.course_id)
+        assignment = self._try_api(
+            lambda: self.canvas.get_assignment(assignment_id, self.course_id),
+            fallback_frontend_func=lambda: self.scrape_assignment_frontend(assignment_id)
+        )
         if not assignment:
             return
         description = assignment.get('description', '') or ''
         html_content = ''
         html_url = assignment.get('html_url')
         if html_url:
-            try:
-                response = self.canvas.session.get(html_url)
-                if response.status_code == 200:
-                    html_content = response.text
-            except Exception as e:
-                print(f"Failed to fetch assignment HTML: {e}")
+            response = self.canvas.session.get(html_url)
+            if response.status_code == 200:
+                html_content = response.text
         self.scrape_html_content(
-            sanitize(assignment.get('name', f'Assignment_{assignment_id}')) + '.html',
             description + html_content
         )
-    
+
+    def scrape_assignment_frontend(self, assignment_id: Union[int, str]) -> None:
+        """
+        For public courses.  Auth-required courses will invoke https://canvas.cornell.edu/api/graphql
+        for assignment files and user submissions
+        """
+        response = self.canvas._request(f"courses/{self.course_id}/assignments/{assignment_id}", use_api_url=False)
+        self.scrape_html_content(response)
+
     def scrape_assignments(self) -> None:
-        assignments = self.canvas.get_assignments(self.course_id)
+        assignments = self._try_api(
+            lambda: self.canvas.get_assignments(self.course_id, **{'per_page': MAX_PER_PAGE}),
+            fallback_frontend_func=lambda: print('Unauthenticated to access assignments (API only, requires login).')
+        )
         if not assignments:
             return
         for assignment in assignments:
@@ -590,12 +654,10 @@ class CanvasCourseScraper:
         for group in assignment_groups:
             for assignment in group.get('assignments', []):
                 self.scrape_assignment(assignment['id'])
+
     
-    def scrape_module(self, module: Dict) -> None:
-        module = self.canvas.get_module(module['id'], self.course_id)
-        if not module or 'items_url' not in module:
-            return
-        items = self.canvas._request("GET", module['items_url'].replace(self.canvas.base_url + '/', ''), params={'per_page': MAX_PER_PAGE})
+    def scrape_module(self, module_id: Union[int, str]) -> None:
+        items = self.canvas.get_module_items(module_id, self.course_id, **{'per_page': MAX_PER_PAGE})
         for item in items:
             if item['type'] == 'File':
                 self.scrape_file(item['content_id'])
@@ -609,13 +671,27 @@ class CanvasCourseScraper:
                 print(f'Skipping item type: {item["type"]} with title: {item["title"]}')
             else:
                 print(f'Unknown type: {item["type"]}')
+
+    def scrape_modules_frontend(self):
+        """
+        For public courses.  Modules endpoint is SSR.
+        """
+        response = self.canvas._request(f"courses/{self.course_id}/modules", use_api_url=False)
+        parsed = html.unescape(response)
+        item_urls = re.findall(r'href="([^"]+/modules/items/\d+)"', parsed)
+        for url in item_urls:
+            response = self.canvas._request(url, use_api_url=False)
+            self.scrape_html_content(response)
     
     def scrape_modules(self) -> None:
-        modules = self.canvas.get_modules(self.course_id, **{'per_page': MAX_PER_PAGE})
+        modules = self._try_api(
+            lambda: self.canvas.get_modules(self.course_id, **{'per_page': MAX_PER_PAGE}),
+            fallback_frontend_func=lambda: self.scrape_modules_frontend()
+        )
         if not modules:
             return
         for module in modules:
-            self.scrape_module(module)
+            self.scrape_module(module['id'])
     
     @ignore_exceptions((UnauthrorizedError, UnauthenticatedError))
     def scrape_remaining_files(self) -> None:
@@ -641,16 +717,24 @@ class CanvasCourseScraper:
 
     def scrape_syllabus(self) -> None:
         syllabus = self.canvas.get_course(self.course_id, **{'include[]': 'syllabus_body'})
-        if not syllabus or not syllabus.get('syllabus_body', ''):
+        if not syllabus:
             return
-        self.scrape_html_content('Syllabus.html', syllabus['syllabus_body'])
+        self.scrape_html_content(syllabus.get('syllabus_body', '') or '')
     
+    def scrape_front_page_frontend(self) -> None:
+        response = self.canvas._request(f"courses/{self.course_id}", use_api_url=False)
+        self.scrape_html_content(response)
+
     @ignore_exceptions((ResourceDoesNotExistError,))
     def scrape_front_page(self) -> None:
-        front_page = self.canvas.show_front_page(self.course_id)
-        if not front_page or not front_page.get('body', ''):
+        front_page = self._try_api(
+            lambda: self.canvas.show_front_page(self.course_id),
+            fallback_frontend_func=lambda: self.scrape_front_page_frontend()
+        )
+        
+        if not front_page:
             return
-        self.scrape_html_content('Homepage.html', front_page['body'])
+        self.scrape_html_content(front_page.get('body', '') or '')
     
     def scrape_course(self) -> 'CanvasCourseScraper':
         course = self.canvas.get_course(self.course_id)
